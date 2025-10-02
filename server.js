@@ -7,6 +7,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+// GET / для проверки сервера
+app.get("/", (req, res) => {
+  res.send("ok");
+});
+
 app.post("/", async (req, res) => {
   try {
     const { messages = [] } = req.body;
