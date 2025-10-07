@@ -15,7 +15,6 @@ app.options("*", (req, res) => res.sendStatus(200));
 
 const PORT = process.env.PORT || 3000;
 
-// ===== ENV =====
 const {
   OPENAI_API_KEY,
   PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS,
@@ -30,15 +29,13 @@ const agent = useProxy ? new HttpsProxyAgent(proxyUrl) : undefined;
 
 const abort = (ms)=>{ const c=new AbortController(); const t=setTimeout(()=>c.abort(),ms); return {signal:c.signal, done:()=>clearTimeout(t)}; };
 
-// ===== Boot log =====
 console.log("🧩 process.cwd():", process.cwd());
-console.log("🚀 New server v3 starting; proxy=", useProxy ? "enabled" : "disabled");
+console.log("🚀 New server v3.1 starting; proxy=", useProxy ? "enabled" : "disabled");
 
-// ===== Health / Debug =====
 app.get("/", (_req,res)=>res.send("ok"));
-app.get("/__version", (_req,res)=>res.send("v3 ✅"));
+app.get("/__version", (_req,res)=>res.send("v3.1 ✅"));
 app.get("/health", (_req,res)=>res.json({
-  ok:true, version:"v3", port:PORT,
+  ok:true, version:"v3.1", port:PORT,
   proxy:{ enabled:useProxy, scheme, host:PROXY_HOST, port:PROXY_PORT, user:!!PROXY_USER },
   openaiKeySet: !!OPENAI_API_KEY
 }));
@@ -71,23 +68,29 @@ app.get("/diag/openai", async (_req,res)=>{
   }
 });
 
+// Для отладки входа
+app.post("/echo", (req,res)=> res.json({ received: req.body ?? null }));
+
 // ===== Chat (Responses API) =====
 app.post("/api/chat", async (req,res)=>{
   const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
   const system = { role:"system", content:"Ты «Менеджер Алексей». Отвечай коротко и по делу." };
   if(!OPENAI_API_KEY) return res.status(500).json({ error:"OPENAI_API_KEY not configured" });
 
+  // ✅ Главное исправление: type должен быть "input_text"
   const input = [system, ...msgs].map(m => ({
     role: m.role,
-    content: [{ type:"text", text:String(m.content ?? "") }]
+    content: [{ type:"input_text", text: String(m.content ?? "") }]
   }));
+
+  console.log("➡️  Calling OpenAI responses with", { turns: input.length });
 
   const {signal,done}=abort(45000);
   try{
     const r = await fetch("https://api.openai.com/v1/responses", {
       method:"POST",
       headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
-      agent,
+      agent, // undefined если DISABLE_PROXY=true → прямое подключение
       body: JSON.stringify({ model:"gpt-4o-mini", input, max_output_tokens:200 }),
       signal
     });
@@ -101,6 +104,7 @@ app.post("/api/chat", async (req,res)=>{
   }
 });
 
+// Совместимость: POST "/" → "/api/chat"
 app.post("/", (req,res)=>{ req.url="/api/chat"; app._router.handle(req,res,()=>{}); });
 
-app.listen(PORT, ()=>console.log(`✅ New server v3 started on ${PORT}; /__version=v3 ✅`));
+app.listen(PORT, ()=>console.log(`✅ New server v3.1 started on ${PORT}; /__version=v3.1 ✅`));
