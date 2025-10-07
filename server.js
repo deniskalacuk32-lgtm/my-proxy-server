@@ -15,7 +15,7 @@ app.options("*", (req, res) => res.sendStatus(200));
 
 const PORT = process.env.PORT || 3000;
 
-// ===== ENV =====
+// === ENV ===
 const {
   OPENAI_API_KEY,
   PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS,
@@ -30,15 +30,15 @@ const agent = useProxy ? new HttpsProxyAgent(proxyUrl) : undefined;
 
 const abort = (ms)=>{ const c=new AbortController(); const t=setTimeout(()=>c.abort(),ms); return {signal:c.signal, done:()=>clearTimeout(t)}; };
 
-// ===== Boot log =====
+// === BOOT ===
 console.log("🧩 process.cwd():", process.cwd());
-console.log("🚀 New server v3.2 starting; proxy=", useProxy ? "enabled" : "disabled");
+console.log("🚀 New server v3.3 (fast) starting; proxy =", useProxy ? "enabled" : "disabled");
 
-// ===== Health / Debug =====
+// === HEALTH ===
 app.get("/", (_req,res)=>res.send("ok"));
-app.get("/__version", (_req,res)=>res.send("v3.2 ✅"));
+app.get("/__version", (_req,res)=>res.send("v3.3 ✅"));
 app.get("/health", (_req,res)=>res.json({
-  ok:true, version:"v3.2", port:PORT,
+  ok:true, version:"v3.3", port:PORT,
   proxy:{ enabled:useProxy, scheme, host:PROXY_HOST, port:PROXY_PORT, user:!!PROXY_USER },
   openaiKeySet: !!OPENAI_API_KEY
 }));
@@ -57,7 +57,7 @@ app.get("/diag/proxy", async (_req,res)=>{
 
 app.get("/diag/openai", async (_req,res)=>{
   if(!OPENAI_API_KEY) return res.status(500).json({ error:"no_openai_key" });
-  const {signal,done}=abort(15000);
+  const {signal,done}=abort(10000);
   try{
     const r = await fetch("https://api.openai.com/v1/models", {
       method:"GET",
@@ -71,7 +71,7 @@ app.get("/diag/openai", async (_req,res)=>{
   }
 });
 
-// ——— системный промт (твой текст) ———
+// === SYSTEM PROMPT ===
 const SYSTEM_PROMPT = `
 Ты — «Менеджер Алексей», живой, дружелюбный и уверенный менеджер по работе с кандидатами.
 
@@ -110,46 +110,54 @@ const SYSTEM_PROMPT = `
 - До появления кнопок не уводи в WhatsApp (исключение — когда у кандидата уже есть карта Газпромбанка).
 `;
 
-// ——— echo для быстрой отладки ———
-app.post("/echo", (req,res)=> res.json({ received: req.body ?? null }));
+// === ECHO (отладка) ===
+app.post("/echo", (req,res)=> res.json({ received:req.body ?? null }));
 
-// ===== Chat (OpenAI Responses API, input_text) =====
+// === MAIN CHAT (ускоренный) ===
 app.post("/api/chat", async (req,res)=>{
   const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
   if(!OPENAI_API_KEY) return res.status(500).json({ error:"OPENAI_API_KEY not configured" });
 
-  // фиксируем системный промт сверху истории
+  // Добавляем системный промт в начало
   const normalized = [
     { role: "system", content: SYSTEM_PROMPT },
     ...msgs
   ];
 
-  // Responses API: content[].type = "input_text"
+  // Правильный формат для Responses API
   const input = normalized.map(m => ({
     role: m.role,
     content: [{ type:"input_text", text: String(m.content ?? "") }]
   }));
 
-  const {signal,done}=abort(45000);
+  const {signal,done}=abort(15000); // ⏱ быстрее — 15 секунд
   try{
     const r = await fetch("https://api.openai.com/v1/responses", {
       method:"POST",
-      headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
-      agent, // undefined если DISABLE_PROXY=true → прямое подключение
-      body: JSON.stringify({ model:"gpt-4o-mini-2024-07-18", input, max_output_tokens:200 }),
+      headers:{
+        "Authorization":`Bearer ${OPENAI_API_KEY}`,
+        "Content-Type":"application/json"
+      },
+      agent,
+      body: JSON.stringify({
+        model:"gpt-4o-mini-2024-07-18",
+        input,
+        max_output_tokens:120 // ⚡ короче ответы — быстрее
+      }),
       signal
     });
+
     const txt = await r.text(); done();
     res.status(r.status).type(r.headers.get("content-type")||"application/json").send(txt);
   }catch(e){
     done();
     const msg = String(e?.message || e);
     const isAbort = /AbortError|aborted/i.test(msg);
-    res.status(isAbort?504:502).json({ error: isAbort?"openai_timeout":"openai_network_error", details: msg });
+    res.status(isAbort?504:502).json({ error:isAbort?"openai_timeout":"openai_network_error", details:msg });
   }
 });
 
-// совместимость: POST "/" → "/api/chat"
+// Совместимость
 app.post("/", (req,res)=>{ req.url="/api/chat"; app._router.handle(req,res,()=>{}); });
 
-app.listen(PORT, ()=>console.log(`✅ New server v3.2 started on ${PORT}; /__version=v3.2 ✅`));
+app.listen(PORT, ()=>console.log(`✅ Fast server v3.3 started on ${PORT}; /__version=v3.3 ✅`));
