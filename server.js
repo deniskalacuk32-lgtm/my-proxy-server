@@ -8,7 +8,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(cors({
   origin: (_o, cb) => cb(null, true),
   methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization","Accept"], // Accept нужен для стрима
+  allowedHeaders: ["Content-Type","Authorization","Accept"],
   maxAge: 86400
 }));
 app.options("*", (_req, res) => res.sendStatus(200));
@@ -69,61 +69,65 @@ const SYSTEM_PROMPT = `
 - До появления кнопок не уводи в WhatsApp (исключение — когда у кандидата уже есть карта Газпромбанка).
 `;
 
+// ===== helpers =====
+function mapMessageToResponsesItem(m){
+  // user/system -> input_text; assistant -> output_text
+  const isAssistant = (m.role === "assistant");
+  const type = isAssistant ? "output_text" : "input_text";
+  return {
+    role: m.role,
+    content: [{ type, text: String(m.content ?? "") }]
+  };
+}
+
 // === HEALTH ===
 app.get("/", (_req,res)=>res.send("ok"));
-app.get("/__version", (_req,res)=>res.send("v3.4-stream ✅"));
+app.get("/__version", (_req,res)=>res.send("v3.5-mapfix ✅"));
 app.get("/health", (_req,res)=>res.json({
-  ok:true, version:"v3.4-stream", port:PORT,
+  ok:true, version:"v3.5-mapfix", port:PORT,
   proxy:{ enabled:useProxy, scheme, host:PROXY_HOST, port:PROXY_PORT, user:!!PROXY_USER },
   openaiKeySet: !!OPENAI_API_KEY
 }));
-app.get("/diag/openai", async (_req,res)=>{
-  if(!OPENAI_API_KEY) return res.status(500).json({ error:"no_openai_key" });
-  const {signal,done}=abort(10000);
-  try{
-    const r = await fetch("https://api.openai.com/v1/models", {
-      headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}` }, agent, signal
-    });
-    const txt = await r.text(); done();
-    res.status(r.status).type(r.headers.get("content-type")||"application/json").send(txt);
-  }catch(e){
-    done(); res.status(504).json({ error:"openai_models_timeout_or_network", details:String(e) });
-  }
-});
 
-// === обычный эндпоинт (на случай нон-стрим) ===
+// === обычный (non-stream) ===
 app.post("/api/chat", async (req,res)=>{
   const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
   if(!OPENAI_API_KEY) return res.status(500).json({ error:"OPENAI_API_KEY not configured" });
+
   const normalized = [{ role:"system", content:SYSTEM_PROMPT }, ...msgs];
-  const input = normalized.map(m=>({ role:m.role, content:[{ type:"input_text", text:String(m.content??"") }]}));
-  const {signal,done}=abort(25000);
-  try{
-    const r = await fetch("https://api.openai.com/v1/responses",{
-      method:"POST",
-      headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
-      agent,
-      body: JSON.stringify({ model:"gpt-4o-mini-2024-07-18", input, max_output_tokens:120 }),
-      signal
-    });
-    const txt = await r.text(); done();
-    res.status(r.status).type(r.headers.get("content-type")||"application/json").send(txt);
-  }catch(e){
-    done(); const msg=String(e?.message||e);
-    res.status(/AbortError|aborted/i.test(msg)?504:502).json({ error:"openai_request_failed", details:msg });
+  const input = normalized.map(mapMessageToResponsesItem);
+
+  // 1 ретрай
+  async function callOnce(timeoutMs){
+    const {signal,done}=abort(timeoutMs);
+    try{
+      const r = await fetch("https://api.openai.com/v1/responses",{
+        method:"POST",
+        headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
+        agent,
+        body: JSON.stringify({ model:"gpt-4o-mini-2024-07-18", input, max_output_tokens:120 }),
+        signal
+      });
+      const txt = await r.text().catch(()=> ""); done();
+      return { ok:r.ok, status:r.status, ct: r.headers.get("content-type")||"application/json", txt };
+    }catch(e){
+      done(); return { ok:false, status:504, ct:"application/json", txt: JSON.stringify({ error:"timeout_or_network", details:String(e) }) };
+    }
   }
+
+  let resp = await callOnce(25000);
+  if (!resp.ok) resp = await callOnce(30000);
+
+  res.status(resp.status).type(resp.ct).send(resp.txt);
 });
 
-// === СТРИМ-ЭНДПОИНТ ===
+// === STREAM (SSE) ===
 app.post("/api/chat-stream", async (req, res) => {
   const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
   if (!OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY not configured" });
 
   const normalized = [{ role: "system", content: SYSTEM_PROMPT }, ...msgs];
-  const input = normalized.map(m => ({
-    role: m.role,
-    content: [{ type: "input_text", text: String(m.content ?? "") }]
-  }));
+  const input = normalized.map(mapMessageToResponsesItem);
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -168,4 +172,4 @@ app.post("/api/chat-stream", async (req, res) => {
 // совместимость
 app.post("/", (req,res)=>{ req.url="/api/chat"; app._router.handle(req,res,()=>{}); });
 
-app.listen(PORT, ()=>console.log(`✅ Server v3.4-stream on ${PORT}`));
+app.listen(PORT, ()=>console.log(`✅ Server v3.5-mapfix on ${PORT}`));
