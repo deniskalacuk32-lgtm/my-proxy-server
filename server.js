@@ -8,10 +8,10 @@ app.use(express.json({ limit: "1mb" }));
 app.use(cors({
   origin: (_o, cb) => cb(null, true),
   methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"],
+  allowedHeaders: ["Content-Type","Authorization","Accept"], // Accept нужен для стрима
   maxAge: 86400
 }));
-app.options("*", (req, res) => res.sendStatus(200));
+app.options("*", (_req, res) => res.sendStatus(200));
 
 const PORT = process.env.PORT || 3000;
 
@@ -29,47 +29,6 @@ const proxyUrl = `${scheme}://${encodeURIComponent(PROXY_USER||"")}:${encodeURIC
 const agent = useProxy ? new HttpsProxyAgent(proxyUrl) : undefined;
 
 const abort = (ms)=>{ const c=new AbortController(); const t=setTimeout(()=>c.abort(),ms); return {signal:c.signal, done:()=>clearTimeout(t)}; };
-
-// === BOOT ===
-console.log("🧩 process.cwd():", process.cwd());
-console.log("🚀 New server v3.3 (fast) starting; proxy =", useProxy ? "enabled" : "disabled");
-
-// === HEALTH ===
-app.get("/", (_req,res)=>res.send("ok"));
-app.get("/__version", (_req,res)=>res.send("v3.3 ✅"));
-app.get("/health", (_req,res)=>res.json({
-  ok:true, version:"v3.3", port:PORT,
-  proxy:{ enabled:useProxy, scheme, host:PROXY_HOST, port:PROXY_PORT, user:!!PROXY_USER },
-  openaiKeySet: !!OPENAI_API_KEY
-}));
-
-app.get("/diag/proxy", async (_req,res)=>{
-  if(!useProxy) return res.json({ proxy:"disabled" });
-  const {signal,done}=abort(10000);
-  try{
-    const r = await fetch("https://httpbin.org/ip", { agent, signal });
-    const txt = await r.text(); done();
-    res.status(r.status).type(r.headers.get("content-type")||"text/plain").send(txt);
-  }catch(e){
-    done(); res.status(504).json({ error:"proxy_connect_failed", details:String(e) });
-  }
-});
-
-app.get("/diag/openai", async (_req,res)=>{
-  if(!OPENAI_API_KEY) return res.status(500).json({ error:"no_openai_key" });
-  const {signal,done}=abort(10000);
-  try{
-    const r = await fetch("https://api.openai.com/v1/models", {
-      method:"GET",
-      headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}` },
-      agent, signal
-    });
-    const txt = await r.text(); done();
-    res.status(r.status).type(r.headers.get("content-type")||"application/json").send(txt);
-  }catch(e){
-    done(); res.status(504).json({ error:"openai_models_timeout_or_network", details:String(e) });
-  }
-});
 
 // === SYSTEM PROMPT ===
 const SYSTEM_PROMPT = `
@@ -110,54 +69,103 @@ const SYSTEM_PROMPT = `
 - До появления кнопок не уводи в WhatsApp (исключение — когда у кандидата уже есть карта Газпромбанка).
 `;
 
-// === ECHO (отладка) ===
-app.post("/echo", (req,res)=> res.json({ received:req.body ?? null }));
+// === HEALTH ===
+app.get("/", (_req,res)=>res.send("ok"));
+app.get("/__version", (_req,res)=>res.send("v3.4-stream ✅"));
+app.get("/health", (_req,res)=>res.json({
+  ok:true, version:"v3.4-stream", port:PORT,
+  proxy:{ enabled:useProxy, scheme, host:PROXY_HOST, port:PROXY_PORT, user:!!PROXY_USER },
+  openaiKeySet: !!OPENAI_API_KEY
+}));
+app.get("/diag/openai", async (_req,res)=>{
+  if(!OPENAI_API_KEY) return res.status(500).json({ error:"no_openai_key" });
+  const {signal,done}=abort(10000);
+  try{
+    const r = await fetch("https://api.openai.com/v1/models", {
+      headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}` }, agent, signal
+    });
+    const txt = await r.text(); done();
+    res.status(r.status).type(r.headers.get("content-type")||"application/json").send(txt);
+  }catch(e){
+    done(); res.status(504).json({ error:"openai_models_timeout_or_network", details:String(e) });
+  }
+});
 
-// === MAIN CHAT (ускоренный) ===
+// === обычный эндпоинт (на случай нон-стрим) ===
 app.post("/api/chat", async (req,res)=>{
   const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
   if(!OPENAI_API_KEY) return res.status(500).json({ error:"OPENAI_API_KEY not configured" });
+  const normalized = [{ role:"system", content:SYSTEM_PROMPT }, ...msgs];
+  const input = normalized.map(m=>({ role:m.role, content:[{ type:"input_text", text:String(m.content??"") }]}));
+  const {signal,done}=abort(25000);
+  try{
+    const r = await fetch("https://api.openai.com/v1/responses",{
+      method:"POST",
+      headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
+      agent,
+      body: JSON.stringify({ model:"gpt-4o-mini-2024-07-18", input, max_output_tokens:120 }),
+      signal
+    });
+    const txt = await r.text(); done();
+    res.status(r.status).type(r.headers.get("content-type")||"application/json").send(txt);
+  }catch(e){
+    done(); const msg=String(e?.message||e);
+    res.status(/AbortError|aborted/i.test(msg)?504:502).json({ error:"openai_request_failed", details:msg });
+  }
+});
 
-  // Добавляем системный промт в начало
-  const normalized = [
-    { role: "system", content: SYSTEM_PROMPT },
-    ...msgs
-  ];
+// === СТРИМ-ЭНДПОИНТ ===
+app.post("/api/chat-stream", async (req, res) => {
+  const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
+  if (!OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY not configured" });
 
-  // Правильный формат для Responses API
+  const normalized = [{ role: "system", content: SYSTEM_PROMPT }, ...msgs];
   const input = normalized.map(m => ({
     role: m.role,
-    content: [{ type:"input_text", text: String(m.content ?? "") }]
+    content: [{ type: "input_text", text: String(m.content ?? "") }]
   }));
 
-  const {signal,done}=abort(15000); // ⏱ быстрее — 15 секунд
-  try{
-    const r = await fetch("https://api.openai.com/v1/responses", {
-      method:"POST",
-      headers:{
-        "Authorization":`Bearer ${OPENAI_API_KEY}`,
-        "Content-Type":"application/json"
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+
+  const { signal, done } = abort(30000);
+
+  try {
+    const upstream = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream"
       },
       agent,
       body: JSON.stringify({
-        model:"gpt-4o-mini-2024-07-18",
+        model: "gpt-4o-mini-2024-07-18",
         input,
-        max_output_tokens:120 // ⚡ короче ответы — быстрее
+        max_output_tokens: 120,
+        stream: true
       }),
       signal
     });
 
-    const txt = await r.text(); done();
-    res.status(r.status).type(r.headers.get("content-type")||"application/json").send(txt);
-  }catch(e){
+    if (!upstream.ok || !upstream.body) {
+      const txt = await upstream.text().catch(()=> "");
+      res.write(`data: ${JSON.stringify({ type:"response.error", message:`HTTP ${upstream.status}: ${txt}` })}\n\n`);
+      return res.end();
+    }
+
+    for await (const chunk of upstream.body) res.write(chunk);
     done();
-    const msg = String(e?.message || e);
-    const isAbort = /AbortError|aborted/i.test(msg);
-    res.status(isAbort?504:502).json({ error:isAbort?"openai_timeout":"openai_network_error", details:msg });
+    res.end();
+  } catch (e) {
+    done();
+    res.write(`data: ${JSON.stringify({ type:"response.error", message:String(e?.message || e) })}\n\n`);
+    res.end();
   }
 });
 
-// Совместимость
+// совместимость
 app.post("/", (req,res)=>{ req.url="/api/chat"; app._router.handle(req,res,()=>{}); });
 
-app.listen(PORT, ()=>console.log(`✅ Fast server v3.3 started on ${PORT}; /__version=v3.3 ✅`));
+app.listen(PORT, ()=>console.log(`✅ Server v3.4-stream on ${PORT}`));
